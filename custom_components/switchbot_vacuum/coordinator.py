@@ -400,7 +400,7 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
     async def _authorize_k10_api(self, session: aiohttp.ClientSession) -> K10Api:
         """Resolve the selected device's family and delegated Qihoo session."""
         await self._ensure_token()
-        if not self._is_k10() or not self.device_mac:
+        if not (self._is_k10() or self._is_k10_pro()) or not self.device_mac:
             raise K10ProtocolError("Select a K10+ device before using K10 room support")
         if not self._k10_group_id:
             devices = await self.async_discover_devices()
@@ -450,22 +450,42 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         await self.async_request_refresh()
 
     async def async_refresh_k10_rooms(self) -> None:
-        """Read K10+ map rooms; retain schedule discovery for K10+ Pro."""
-        if self._is_k10():
-            try:
-                session = async_get_clientsession(self.hass)
-                api = await self._authorize_k10_api(session)
-                map_data, _ = await api.get_map(session)
+        """Discover K10-family rooms from the map; use legacy Pro policy as fallback."""
+        # Both K10+ and K10+ Pro can read the signed cloud map. The camera
+        # already uses this endpoint successfully for the Pro.
+        try:
+            session = async_get_clientsession(self.hass)
+            api = await self._authorize_k10_api(session)
+            map_data, _ = await api.get_map(session)
+            map_rooms = room_names(map_data)
+            _LOGGER.info(
+                "K10%s map room discovery: %d rooms, IDs/names: %s",
+                "+ Pro" if self._is_k10_pro() else "+",
+                len(map_rooms),
+                {str(room_id): name for room_id, name in map_rooms.items()},
+            )
+            if map_rooms:
                 self._rooms = {
-                    f"room{room_id}": name for room_id, name in room_names(map_data).items()
+                    f"room{room_id}": name for room_id, name in map_rooms.items()
                 }
                 self._last_room_refresh = time.time()
-            except (
-                aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError, K10ProtocolError
-            ) as exc:
-                # Network exceptions may contain a signed map URL; log only the type.
-                _LOGGER.warning("K10+ map refresh failed (%s)", type(exc).__name__)
+                self._persist_rooms()
+                return
+            _LOGGER.warning("K10-family map contained no discoverable smartArea rooms")
+        except (
+            aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError,
+            K10ProtocolError,
+        ) as exc:
+            # Do not log exception messages: network errors can contain signed URLs.
+            _LOGGER.warning(
+                "K10-family map room discovery failed (%s)", type(exc).__name__
+            )
+
+        if not self._is_k10_pro():
             return
+
+        # Legacy Pro discovery retained so an unsupported map layout does not
+        # interrupt existing rooms or prevent normal vacuum control.
         try:
             resp = await self.async_send_action("GetCleanPolicyList")
             if resp.get("statusCode") != 100:
@@ -483,12 +503,21 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
                 for rid in entry.get("smartAreaIds", []):
                     room_ids.add(rid)
 
+            _LOGGER.info(
+                "K10+ Pro legacy GetCleanPolicyList: %d unique room IDs: %s",
+                len(room_ids), sorted(room_ids),
+            )
             if room_ids:
-                self._rooms = {f"room{rid}": f"room{rid}" for rid in sorted(room_ids)}
+                self._rooms = {
+                    f"room{rid}": f"room{rid}" for rid in sorted(room_ids)
+                }
                 self._last_room_refresh = time.time()
-                _LOGGER.info("Loaded %d K10+ rooms: %s", len(self._rooms), list(self._rooms))
+                self._persist_rooms()
         except Exception as exc:
-            _LOGGER.warning("Failed to refresh K10+ rooms: %s", exc)
+            # Pro responses may carry cloud metadata; log only exception type.
+            _LOGGER.warning(
+                "K10+ Pro legacy room discovery failed (%s)", type(exc).__name__
+            )
 
     def _extract_rooms_from_room_plans(self, room_plans: Any) -> dict[str, str]:
         """Try to extract room names from PROP_ROOM_PLANS property."""
