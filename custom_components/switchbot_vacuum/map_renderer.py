@@ -1,4 +1,4 @@
-"""Render SwitchBot K10+ cloud map data as PNG."""
+"""Render SwitchBot K10+/K10+ Pro cloud map data as PNG."""
 from __future__ import annotations
 
 import base64
@@ -6,25 +6,21 @@ import io
 import json
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 SCALE = 4
+ORIENTATION_OPS = ("flip_tb", "rot180")
 ROOM_COLORS = [
-    (125, 195, 245, 210),
-    (160, 175, 245, 210),
-    (255, 215, 110, 210),
-    (170, 230, 215, 210),
-    (240, 165, 140, 210),
+    (125, 195, 245, 200),
+    (160, 175, 245, 200),
+    (255, 215, 110, 200),
+    (170, 230, 215, 200),
+    (240, 165, 140, 200),
 ]
 
 
 def _lz4_block_decompress(data: bytes, max_output_size: int) -> bytes:
-    """Decompress a raw LZ4 block without requiring the external lz4 package.
-
-    The K10+ map payload uses the standard LZ4 block format.  This compact
-    decoder intentionally implements only block decoding; frames are not used
-    by the robot payload.
-    """
+    """Decompress the raw LZ4 block used by the vacuum map."""
     src = memoryview(data)
     pos = 0
     out = bytearray()
@@ -52,7 +48,6 @@ def _lz4_block_decompress(data: bytes, max_output_size: int) -> bytes:
         out.extend(src[pos : pos + literal_len])
         pos += literal_len
 
-        # A block may legally end after the final literal run.
         if pos >= size:
             break
 
@@ -86,8 +81,13 @@ def _lz4_block_decompress(data: bytes, max_output_size: int) -> bytes:
     return bytes(out)
 
 
+def _normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
+    if "data" in data and isinstance(data["data"], dict):
+        return data["data"]
+    return data
+
+
 def _decode_name(value: Any) -> str:
-    """Decode Base64 room names used by the K10 map payload."""
     if not isinstance(value, str):
         return ""
     try:
@@ -97,7 +97,6 @@ def _decode_name(value: Any) -> str:
 
 
 def _smart_areas(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return smartArea entries from dict or JSON-string payloads."""
     smart = data.get("smartArea", {})
     if isinstance(smart, str):
         try:
@@ -111,7 +110,7 @@ def _smart_areas(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _font(size: int) -> ImageFont.ImageFont:
-    for name in ("DejaVuSans.ttf", "Arial.ttf", "arial.ttf"):
+    for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf", "tahoma.ttf"):
         try:
             return ImageFont.truetype(name, size)
         except OSError:
@@ -119,10 +118,101 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _centroid(points: list[tuple[int, int]]) -> tuple[int, int]:
+    """Polygon centroid matching the standalone renderer without numpy."""
+    if not points:
+        return 0, 0
+    if len(points) < 3:
+        return points[0]
+
+    twice_area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for idx, (x1, y1) in enumerate(points):
+        x2, y2 = points[(idx + 1) % len(points)]
+        cross = x1 * y2 - x2 * y1
+        twice_area += cross
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+
+    if abs(twice_area) < 1e-6:
+        return (
+            sum(p[0] for p in points) // len(points),
+            sum(p[1] for p in points) // len(points),
+        )
+
+    return int(cx / (3.0 * twice_area)), int(cy / (3.0 * twice_area))
+
+
+def _apply_orientation(img: Image.Image) -> Image.Image:
+    for op in ORIENTATION_OPS:
+        if op == "flip_tb":
+            img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        elif op == "flip_lr":
+            img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        elif op == "rot180":
+            img = img.transpose(Image.Transpose.ROTATE_180)
+    return img
+
+
+def _transform_point(x: int, y: int, width: int, height: int) -> tuple[int, int]:
+    for op in ORIENTATION_OPS:
+        if op == "flip_tb":
+            y = (height - 1) - y
+        elif op == "flip_lr":
+            x = (width - 1) - x
+        elif op == "rot180":
+            x, y = (width - 1) - x, (height - 1) - y
+    return x, y
+
+
+def _draw_path_soft(
+    base: Image.Image,
+    points: list[tuple[int, int]],
+    width_px: int = 2,
+    color: tuple[int, int, int, int] = (255, 255, 255, 210),
+    aa: int = 3,
+    blur: float = 0.8,
+) -> Image.Image:
+    if len(points) < 2:
+        return base
+    width, height = base.size
+    hi = Image.new("RGBA", (width * aa, height * aa), (0, 0, 0, 0))
+    ImageDraw.Draw(hi).line(
+        [(int(x * aa), int(y * aa)) for x, y in points],
+        fill=color,
+        width=max(1, int(width_px * aa)),
+    )
+    if blur > 0:
+        hi = hi.filter(ImageFilter.GaussianBlur(radius=blur * aa / 3.0))
+    return Image.alpha_composite(base, hi.resize((width, height), Image.Resampling.LANCZOS))
+
+
+def _draw_pill(draw: ImageDraw.ImageDraw, cx: int, cy: int, text: str, scale: int) -> None:
+    font = _font(int(5.5 * scale))
+    pad_x = int(4.0 * scale)
+    pad_y = int(2.5 * scale)
+    radius = int(4.0 * scale)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    pill_w = tw + 2 * pad_x
+    pill_h = th + 2 * pad_y
+    x0 = cx - pill_w // 2
+    y0 = cy - pill_h // 2
+    draw.rounded_rectangle(
+        (x0, y0, x0 + pill_w, y0 + pill_h),
+        radius=radius,
+        fill=(45, 45, 45, 140),
+    )
+    draw.text((cx, cy), text, font=font, fill=(255, 255, 255, 245), anchor="mm")
+
+
 def render_map_png(data: dict[str, Any], scale: int = SCALE) -> bytes:
-    """Render a K10+ map payload to PNG bytes."""
+    """Render the cloud map using the same look as the original standalone renderer."""
     if not isinstance(data, dict):
         raise ValueError("Map payload is not an object")
+    data = _normalize_payload(data)
 
     map_str = data.get("map")
     if not isinstance(map_str, str) or not map_str:
@@ -146,111 +236,132 @@ def render_map_png(data: dict[str, Any], scale: int = SCALE) -> bytes:
     decoded = decoded[: width * height]
 
     def to_px(x_mm: float, y_mm: float) -> tuple[int, int]:
-        x = int(((float(x_mm) / 1000.0) - x_min) / resolution)
-        y = int(((float(y_mm) / 1000.0) - y_min) / resolution)
-        return max(0, min(width - 1, x)), max(0, min(height - 1, y))
+        px = int(((float(x_mm) / 1000.0) - x_min) / resolution)
+        py = int(((float(y_mm) / 1000.0) - y_min) / resolution)
+        return max(0, min(width - 1, px)), max(0, min(height - 1, py))
 
-    # Pixel classes used by the current K10 payload: 0 wall, 127 unknown, 255 floor.
-    img = Image.new("RGBA", (width, height), (252, 252, 252, 255))
-    pixels = img.load()
+    # Original renderer background: white with a very light unknown-space overlay.
+    base = Image.new("RGBA", (width, height), (252, 252, 252, 255))
+    unknown = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    unknown_px = unknown.load()
+    floor_mask = Image.new("L", (width, height), 0)
+    floor_px = floor_mask.load()
+
     for y in range(height):
         row = y * width
         for x in range(width):
             value = decoded[row + x]
-            if value == 0:
-                pixels[x, y] = (40, 45, 60, 255)
-            elif value == 127:
-                pixels[x, y] = (245, 246, 248, 255)
+            if value == 127:
+                unknown_px[x, y] = (245, 246, 248, 255)
+            elif value == 255:
+                floor_px[x, y] = 255
+    base = Image.alpha_composite(base, unknown)
 
+    # Rooms: restrict the polygon overlay to real floor pixels exactly like the old script.
     rooms = _smart_areas(data)
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    room_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     room_centres: list[tuple[int, int, str]] = []
 
     for index, room in enumerate(rooms):
         if not isinstance(room, dict):
             continue
         vertices = room.get("vertexs", [])
-        points = []
-        if isinstance(vertices, list):
-            for vertex in vertices:
-                if isinstance(vertex, (list, tuple)) and len(vertex) >= 2:
-                    points.append(to_px(vertex[0], vertex[1]))
+        points = [
+            to_px(v[0], v[1])
+            for v in vertices
+            if isinstance(v, (list, tuple)) and len(v) >= 2
+        ]
         if len(points) < 3:
             continue
-        draw.polygon(points, fill=ROOM_COLORS[index % len(ROOM_COLORS)])
-        cx = sum(p[0] for p in points) // len(points)
-        cy = sum(p[1] for p in points) // len(points)
+
+        polygon_mask = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(polygon_mask).polygon(points, fill=255)
+        clipped_mask = ImageChops.multiply(polygon_mask, floor_mask)
+        room_color = Image.new("RGBA", (width, height), ROOM_COLORS[index % len(ROOM_COLORS)])
+        room_layer = Image.composite(room_color, room_layer, clipped_mask)
+        cx, cy = _centroid(points)
         room_centres.append((cx, cy, _decode_name(room.get("name", ""))))
 
-    img = Image.alpha_composite(img, overlay)
+    base = Image.alpha_composite(base, room_layer)
+
+    # Thin wall outline: draw only boundary pixels of wall regions, not the whole wall mask.
+    wall_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    wall_px = wall_layer.load()
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            if decoded[row + x] != 0:
+                continue
+            interior = True
+            for nx, ny in ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)):
+                if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    interior = False
+                    break
+                if decoded[ny * width + nx] != 0:
+                    interior = False
+                    break
+            if not interior:
+                wall_px[x, y] = (40, 45, 60, 255)
+    base = Image.alpha_composite(base, wall_layer)
 
     # Forbidden areas / virtual walls.
+    forbid = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    forbid_draw = ImageDraw.Draw(forbid)
     areas = data.get("area", [])
     if isinstance(areas, list):
-        layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        area_draw = ImageDraw.Draw(layer)
         for area in areas:
             if not isinstance(area, dict):
                 continue
             vertices = area.get("vertexs", [])
-            points = [to_px(v[0], v[1]) for v in vertices if isinstance(v, (list, tuple)) and len(v) >= 2]
+            points = [
+                to_px(v[0], v[1])
+                for v in vertices
+                if isinstance(v, (list, tuple)) and len(v) >= 2
+            ]
             if len(points) >= 3 and area.get("active") == "forbid":
-                area_draw.polygon(points, fill=(235, 80, 80, 55), outline=(170, 40, 40, 220))
+                forbid_draw.polygon(points, fill=(235, 80, 80, 60), outline=(170, 40, 40, 200))
             elif len(points) >= 2:
-                area_draw.line(points, fill=(170, 40, 40, 220), width=1)
-        img = Image.alpha_composite(img, layer)
+                forbid_draw.line(points, fill=(170, 40, 40, 200), width=1)
+    base = Image.alpha_composite(base, forbid)
 
-    # Match the orientation used by the existing standalone renderer.
-    img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM).transpose(Image.Transpose.ROTATE_180)
-    img = img.resize((width * scale, height * scale), Image.Resampling.NEAREST)
+    # Same orientation and pixel-perfect nearest-neighbour scaling as the old renderer.
+    base = _apply_orientation(base)
+    map_scaled = base.resize((width * scale, height * scale), Image.Resampling.NEAREST)
 
-    def transform(x: int, y: int) -> tuple[int, int]:
-        # flip_tb followed by rot180 is equivalent to a horizontal flip.
-        return (width - 1 - x) * scale, y * scale
-
-    top = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    top_draw = ImageDraw.Draw(top)
-
-    # Cleaning route.
+    # Soft antialiased cleaning route.
     route = data.get("posArray", [])
+    route_points: list[tuple[int, int]] = []
     if isinstance(route, list):
-        route_points = []
         for point in route:
             if isinstance(point, (list, tuple)) and len(point) >= 2:
-                route_points.append(transform(*to_px(point[0], point[1])))
-        if len(route_points) >= 2:
-            top_draw.line(route_points, fill=(255, 255, 255, 220), width=max(2, scale))
+                tx, ty = _transform_point(*to_px(point[0], point[1]), width, height)
+                route_points.append((tx * scale, ty * scale))
+    map_scaled = _draw_path_soft(map_scaled, route_points)
 
-    # Room labels.
-    font = _font(max(12, int(5.5 * scale)))
+    # Labels + charging station on the final top layer.
+    top = Image.new("RGBA", map_scaled.size, (0, 0, 0, 0))
+    top_draw = ImageDraw.Draw(top)
+
     for cx, cy, name in room_centres:
         if not name:
             continue
-        x, y = transform(cx, cy)
-        bbox = top_draw.textbbox((0, 0), name, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        px, py = 4 * scale, 2 * scale
-        top_draw.rounded_rectangle(
-            (x - tw // 2 - px, y - th // 2 - py, x + tw // 2 + px, y + th // 2 + py),
-            radius=4 * scale,
-            fill=(45, 45, 45, 150),
-        )
-        top_draw.text((x, y), name, font=font, fill=(255, 255, 255, 245), anchor="mm")
+        tx, ty = _transform_point(cx, cy, width, height)
+        _draw_pill(top_draw, tx * scale, ty * scale, name, scale)
 
-    # Charging station.
     charger = data.get("chargeHandlePos")
     if isinstance(charger, (list, tuple)) and len(charger) >= 2:
-        x, y = transform(*to_px(charger[0], charger[1]))
+        tx, ty = _transform_point(*to_px(charger[0], charger[1]), width, height)
         radius = 6 * scale
+        cx = tx * scale
+        cy = ty * scale
         top_draw.ellipse(
-            (x - radius, y - radius, x + radius, y + radius),
-            fill=(160, 32, 240, 220),
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=(160, 32, 240, 200),
             outline=(255, 255, 255, 255),
-            width=max(1, scale),
+            width=max(1, int(1.5 * scale)),
         )
 
-    img = Image.alpha_composite(img, top)
+    image = Image.alpha_composite(map_scaled, top)
     output = io.BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    image.convert("RGB").save(output, format="PNG", optimize=True)
     return output.getvalue()
