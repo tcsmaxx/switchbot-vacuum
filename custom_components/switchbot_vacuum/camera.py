@@ -1,4 +1,4 @@
-"""Camera entity for the SwitchBot K10+ map."""
+"""Camera entity for the SwitchBot K10+/K10+ Pro map."""
 from __future__ import annotations
 
 import logging
@@ -11,9 +11,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DEVICE_TYPE_K10, DEVICE_TYPE_TO_MODEL, DOMAIN
+from .const import DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO, DEVICE_TYPE_TO_MODEL, DOMAIN
 from .coordinator import SwitchBotS10Coordinator
-from .k10_api import K10ProtocolError
+from .k10_api import K10Api, K10ProtocolError
 from .map_renderer import render_map_png
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,8 +24,8 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the map camera for supported devices."""
-    if entry.data.get("device_type") != DEVICE_TYPE_K10:
+    """Set up the map camera for supported K10-family devices."""
+    if entry.data.get("device_type") not in (DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO):
         return
 
     coordinator: SwitchBotS10Coordinator = hass.data[DOMAIN][entry.entry_id]
@@ -33,7 +33,7 @@ async def async_setup_entry(
 
 
 class SwitchBotVacuumMapCamera(Camera):
-    """Render the current K10+ cloud map as a Home Assistant camera."""
+    """Render the current K10-family cloud map as a Home Assistant camera."""
 
     _attr_has_entity_name = True
     _attr_name = "Map"
@@ -53,14 +53,55 @@ class SwitchBotVacuumMapCamera(Camera):
             model=DEVICE_TYPE_TO_MODEL.get(device_type, device_type),
         )
         self._last_image: bytes | None = None
+        self._map_api: K10Api | None = None
+        self._group_id: str | None = None
+
+    async def _authorize_map_api(self, session: aiohttp.ClientSession) -> K10Api:
+        """Authorize the delegated map API for K10+ and K10+ Pro.
+
+        Upstream currently enables this Qihoo/Botslab API only for the K10+.
+        The K10+ Pro is intentionally tried here in isolation so a failed map
+        request cannot affect the normal Pro coordinator/control path.
+        """
+        await self.coordinator._ensure_token()
+        if not self.coordinator.device_mac:
+            raise K10ProtocolError("Vacuum device identifier is unavailable")
+
+        if not self._group_id:
+            devices = await self.coordinator.async_discover_devices()
+            selected = next(
+                (d for d in devices if d["device_mac"] == self.coordinator.device_mac),
+                None,
+            )
+            if not selected or not selected.get("group_id"):
+                raise K10ProtocolError("The selected vacuum has no family identifier")
+            self._group_id = selected["group_id"]
+
+        if self._map_api is None:
+            self._map_api = K10Api(
+                self.coordinator.device_mac,
+                await self.coordinator._get_product_key(),
+                self.coordinator._uuid.replace("-", ""),
+            )
+
+        if not self.coordinator.access_token or not self.coordinator.wonderlab_endpoint:
+            raise K10ProtocolError("SwitchBot account session is unavailable")
+
+        await self._map_api.authorize(
+            session,
+            self.coordinator.wonderlab_endpoint,
+            self.coordinator.access_token,
+            self._group_id,
+        )
+        return self._map_api
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return the latest K10+ map image."""
+        """Return the latest K10-family map image."""
         try:
             session = async_get_clientsession(self.hass)
-            api = await self.coordinator._authorize_k10_api(session)
+            api = await self._authorize_map_api(session)
             map_data, _ = await api.get_map(session)
             self._last_image = await self.hass.async_add_executor_job(
                 render_map_png, map_data
@@ -74,5 +115,7 @@ class SwitchBotVacuumMapCamera(Camera):
             TypeError,
             K10ProtocolError,
         ) as exc:
-            _LOGGER.warning("K10+ map image refresh failed (%s)", type(exc).__name__)
+            _LOGGER.warning(
+                "K10-family map image refresh failed (%s)", type(exc).__name__
+            )
             return self._last_image
