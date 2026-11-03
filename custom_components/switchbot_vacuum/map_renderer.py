@@ -109,6 +109,35 @@ def _smart_areas(data: dict[str, Any]) -> list[dict[str, Any]]:
     return smart if isinstance(smart, list) else []
 
 
+def extract_route_points(data: dict[str, Any]) -> list[tuple[float, float]]:
+    """Read known position-array shapes without exposing map coordinates in logs."""
+    payload = _normalize_payload(data)
+    route = payload.get("posArray", [])
+    if isinstance(route, str):
+        try:
+            route = json.loads(route)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(route, dict):
+        route = route.get("value", route.get("points", []))
+    if not isinstance(route, list):
+        return []
+
+    points: list[tuple[float, float]] = []
+    for item in route:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            x, y = item[:2]
+        elif isinstance(item, dict):
+            x, y = item.get("x"), item.get("y")
+        else:
+            continue
+        try:
+            points.append((float(x), float(y)))
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
 def _font(size: int) -> ImageFont.ImageFont:
     for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf", "tahoma.ttf"):
         try:
@@ -329,14 +358,11 @@ def render_map_png(data: dict[str, Any], scale: int = SCALE) -> bytes:
     base = _apply_orientation(base)
     map_scaled = base.resize((width * scale, height * scale), Image.Resampling.NEAREST)
 
-    # Soft antialiased cleaning route.
-    route = data.get("posArray", [])
+    # Soft antialiased cleaning route (same geometry as the standalone map).
     route_points: list[tuple[int, int]] = []
-    if isinstance(route, list):
-        for point in route:
-            if isinstance(point, (list, tuple)) and len(point) >= 2:
-                tx, ty = _transform_point(*to_px(point[0], point[1]), width, height)
-                route_points.append((tx * scale, ty * scale))
+    for x_mm, y_mm in extract_route_points(data):
+        tx, ty = _transform_point(*to_px(x_mm, y_mm), width, height)
+        route_points.append((tx * scale, ty * scale))
     map_scaled = _draw_path_soft(map_scaled, route_points)
 
     # Labels + charging station on the final top layer.
