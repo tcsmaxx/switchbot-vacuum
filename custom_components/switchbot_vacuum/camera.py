@@ -14,7 +14,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO, DEVICE_TYPE_TO_MODEL, DOMAIN
 from .coordinator import SwitchBotS10Coordinator
 from .k10_api import K10Api, K10ProtocolError
-from .map_renderer import render_map_png
+from .map_renderer import extract_route_points, render_map_png
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class SwitchBotVacuumMapCamera(Camera):
         self._last_image: bytes | None = None
         self._map_api: K10Api | None = None
         self._group_id: str | None = None
+        self._last_route_diagnostic: tuple[str, int, int] | None = None
 
     async def _authorize_map_api(self, session: aiohttp.ClientSession) -> K10Api:
         """Authorize the delegated map API for K10+ and K10+ Pro.
@@ -103,6 +104,20 @@ class SwitchBotVacuumMapCamera(Camera):
             session = async_get_clientsession(self.hass)
             api = await self._authorize_map_api(session)
             map_data, _ = await api.get_map(session)
+            # Log metadata only: no raw payload, room geometry, tokens or signed URLs.
+            payload = map_data.get("data", map_data) if isinstance(map_data, dict) else {}
+            route = payload.get("posArray") if isinstance(payload, dict) else None
+            route_kind = type(route).__name__
+            route_size = len(route) if isinstance(route, (list, dict, str)) else 0
+            decoded_count = len(extract_route_points(map_data))
+            diagnostic = (route_kind, route_size, decoded_count)
+            if diagnostic != self._last_route_diagnostic:
+                _LOGGER.info(
+                    "K10-family map route diagnostic: posArray_type=%s, "
+                    "posArray_length=%d, parsed_points=%d",
+                    *diagnostic,
+                )
+                self._last_route_diagnostic = diagnostic
             self._last_image = await self.hass.async_add_executor_job(
                 render_map_png, map_data
             )
