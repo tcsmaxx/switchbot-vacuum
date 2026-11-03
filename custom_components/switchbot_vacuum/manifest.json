@@ -1,16 +1,12 @@
 {
   "domain": "switchbot_vacuum",
   "name": "SwitchBot Vacuum",
-  "version": "0.4.1-map.1",
-  "documentation": "https://github.com/tcsmaxx/switchbot-vacuum",
-  "issue_tracker": "https://github.com/tcsmaxx/switchbot-vacuum/issues",
-  "codeowners": ["@tcsmaxx"],
+  "version": "0.5.0",
+  "documentation": "https://github.com/jaco/switchbot-vacuum",
+  "issue_tracker": "https://github.com/jaco/switchbot-vacuum/issues",
+  "codeowners": ["@jaczewski"],
   "config_flow": true,
   "iot_class": "cloud_polling",
-  "requirements": [
-    "aiobotocore>=2.9.0",
-    "lz4>=4.3.3",
-    "Pillow>=10.0.0"
-  ],
+  "requirements": ["aiobotocore>=2.9.0", "lz4>=4.3.3", "Pillow>=10.0.0"],
   "dependencies": []
 }
