@@ -10,8 +10,14 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN
 from .coordinator import SwitchBotS10Coordinator
 
-PLATFORMS: list[Platform] = [Platform.VACUUM, Platform.SENSOR, Platform.BINARY_SENSOR,
-                             Platform.BUTTON, Platform.SELECT]
+PLATFORMS: list[Platform] = [
+    Platform.VACUUM,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SELECT,
+    Platform.CAMERA,
+]
 
 _LOGGER = logging.getLogger(__name__)
 
