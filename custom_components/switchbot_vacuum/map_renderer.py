@@ -6,7 +6,6 @@ import io
 import json
 from typing import Any
 
-import lz4.block
 from PIL import Image, ImageDraw, ImageFont
 
 SCALE = 4
@@ -17,6 +16,74 @@ ROOM_COLORS = [
     (170, 230, 215, 210),
     (240, 165, 140, 210),
 ]
+
+
+def _lz4_block_decompress(data: bytes, max_output_size: int) -> bytes:
+    """Decompress a raw LZ4 block without requiring the external lz4 package.
+
+    The K10+ map payload uses the standard LZ4 block format.  This compact
+    decoder intentionally implements only block decoding; frames are not used
+    by the robot payload.
+    """
+    src = memoryview(data)
+    pos = 0
+    out = bytearray()
+    size = len(src)
+
+    while pos < size:
+        token = src[pos]
+        pos += 1
+
+        literal_len = token >> 4
+        if literal_len == 15:
+            while True:
+                if pos >= size:
+                    raise ValueError("Invalid LZ4 block: truncated literal length")
+                extra = src[pos]
+                pos += 1
+                literal_len += extra
+                if extra != 255:
+                    break
+
+        if pos + literal_len > size:
+            raise ValueError("Invalid LZ4 block: truncated literals")
+        if len(out) + literal_len > max_output_size:
+            raise ValueError("LZ4 map exceeds expected maximum size")
+        out.extend(src[pos : pos + literal_len])
+        pos += literal_len
+
+        # A block may legally end after the final literal run.
+        if pos >= size:
+            break
+
+        if pos + 2 > size:
+            raise ValueError("Invalid LZ4 block: missing match offset")
+        offset = int(src[pos]) | (int(src[pos + 1]) << 8)
+        pos += 2
+        if offset <= 0 or offset > len(out):
+            raise ValueError("Invalid LZ4 block: bad match offset")
+
+        match_len = token & 0x0F
+        if match_len == 15:
+            while True:
+                if pos >= size:
+                    raise ValueError("Invalid LZ4 block: truncated match length")
+                extra = src[pos]
+                pos += 1
+                match_len += extra
+                if extra != 255:
+                    break
+        match_len += 4
+
+        if len(out) + match_len > max_output_size:
+            raise ValueError("LZ4 map exceeds expected maximum size")
+
+        match_start = len(out) - offset
+        for _ in range(match_len):
+            out.append(out[match_start])
+            match_start += 1
+
+    return bytes(out)
 
 
 def _decode_name(value: Any) -> str:
@@ -71,8 +138,8 @@ def render_map_png(data: dict[str, Any], scale: int = SCALE) -> bytes:
 
     raw = base64.b64decode(map_str)
     declared_height = int(data.get("height") or 0)
-    expected = width * declared_height if declared_height > 0 else width * 1500
-    decoded = lz4.block.decompress(raw, uncompressed_size=expected)
+    max_output = width * declared_height if declared_height > 0 else width * 1500
+    decoded = _lz4_block_decompress(raw, max_output)
     height = len(decoded) // width
     if height <= 0:
         raise ValueError("Decoded map height is invalid")
