@@ -189,10 +189,11 @@ def _draw_path_soft(
 
 
 def _draw_pill(draw: ImageDraw.ImageDraw, cx: int, cy: int, text: str, scale: int) -> None:
-    font = _font(int(5.5 * scale))
-    pad_x = int(4.0 * scale)
-    pad_y = int(2.5 * scale)
-    radius = int(4.0 * scale)
+    # Room name badges: 36% larger than the original renderer for readability.
+    font = _font(int(7.5 * scale))
+    pad_x = int(5.5 * scale)
+    pad_y = int(3.4 * scale)
+    radius = int(5.5 * scale)
     bbox = draw.textbbox((0, 0), text, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
